@@ -394,11 +394,7 @@ class ServerArgs(DisaggArgsMixin):
                 self.vae_cpu_offload = True
 
     def _adjust_ltx2_two_stage_device_mode(self):
-        is_ltx23_two_stage = self.pipeline_class_name == "LTX2TwoStagePipeline" and (
-            self._is_ltx23_model_path(self.model_path)
-            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
-        )
-        if not is_ltx23_two_stage:
+        if not self._is_ltx23_two_stage_pipeline():
             return
 
         mode = self.ltx2_two_stage_device_mode
@@ -448,6 +444,12 @@ class ServerArgs(DisaggArgsMixin):
             device_total_memory_gb,
         )
         return "snapshot"
+
+    def _is_ltx23_two_stage_pipeline(self) -> bool:
+        return self.pipeline_class_name == "LTX2TwoStagePipeline" and (
+            self._is_ltx23_model_path(self.model_path)
+            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
 
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
@@ -542,6 +544,13 @@ class ServerArgs(DisaggArgsMixin):
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
 
+        self.adjust_parallelism_for_ltx(
+            tp_unspecified=tp_unspecified,
+            sp_unspecified=sp_unspecified,
+            ulysses_unspecified=ulysses_unspecified,
+            ring_unspecified=ring_unspecified,
+        )
+
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
 
@@ -602,6 +611,46 @@ class ServerArgs(DisaggArgsMixin):
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def adjust_parallelism_for_ltx(
+        self,
+        *,
+        tp_unspecified: bool,
+        sp_unspecified: bool,
+        ulysses_unspecified: bool,
+        ring_unspecified: bool,
+    ) -> None:
+        """
+        Auto-adjust parallelism defaults for LTX-2.3 two-stage.
+
+        For multi-GPU runs, default to full TP (tp_size=num_gpus) when users do
+        not explicitly configure TP/SP/Ulysses/Ring knobs. This matches our
+        preferred default on current LTX-2.3 two-stage workloads.
+        """
+        if not self._is_ltx23_two_stage_pipeline() or self.num_gpus <= 1:
+            return
+
+        if not tp_unspecified:
+            return
+
+        # Respect explicit sequence-parallel knobs if the user set any of them.
+        if not (sp_unspecified and ulysses_unspecified and ring_unspecified):
+            logger.info(
+                "Skip automatic LTX TP adjustment because SP/Ulysses/Ring is explicitly configured "
+                "(sp_degree=%s, ulysses_degree=%s, ring_degree=%s).",
+                self.sp_degree,
+                self.ulysses_degree,
+                self.ring_degree,
+            )
+            return
+
+        self.tp_size = self.num_gpus
+        logger.info(
+            "Automatically set tp_size=%s for LTX-2.3 two-stage on %s GPUs. "
+            "Use --tp-size to override.",
+            self.tp_size,
+            self.num_gpus,
+        )
 
     def _model_default_uses_cfg(self) -> bool:
         """
